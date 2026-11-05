@@ -82,7 +82,12 @@ def load_checkpoint(fpath):
         raise FileNotFoundError('File is not found at "{}"'.format(fpath))
     map_location = None if torch.cuda.is_available() else 'cpu'
     try:
-        checkpoint = torch.load(fpath, map_location=map_location)
+        try:
+            checkpoint = torch.load(
+                fpath, map_location=map_location, weights_only=False
+            )
+        except TypeError:
+            checkpoint = torch.load(fpath, map_location=map_location)
     except UnicodeDecodeError:
         pickle.load = partial(pickle.load, encoding="latin1")
         pickle.Unpickler = partial(pickle.Unpickler, encoding="latin1")

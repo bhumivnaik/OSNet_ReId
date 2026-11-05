@@ -1,5 +1,9 @@
 from __future__ import division, print_function, absolute_import
 import time
+import csv
+import os
+import shutil
+import random
 import numpy as np
 import os.path as osp
 import datetime
@@ -14,6 +18,16 @@ from torchreid.utils import (
     open_specified_layers, visualize_ranked_results
 )
 from torchreid.losses import DeepSupervision
+
+
+def _append_csv(path, fieldnames, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, 'a', newline='') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 class Engine(object):
@@ -32,6 +46,11 @@ class Engine(object):
         self.use_gpu = (torch.cuda.is_available() and use_gpu)
         self.writer = None
         self.epoch = 0
+        self.last_eval_metrics = {}
+        self.best_mAP = 0.0
+        self.output_dir = None
+        self.logs_dir = None
+        self.checkpoints_dir = None
 
         self.model = None
         self.optimizer = None
@@ -72,21 +91,45 @@ class Engine(object):
         else:
             return names_real
 
-    def save_model(self, epoch, rank1, save_dir, is_best=False):
+    def save_model(self, epoch, rank1, save_dir, is_best=False, mAP=None):
         names = self.get_model_names()
+        if self.checkpoints_dir is None:
+            self.checkpoints_dir = osp.join(save_dir, 'checkpoints')
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
 
         for name in names:
-            save_checkpoint(
-                {
-                    'state_dict': self._models[name].state_dict(),
-                    'epoch': epoch + 1,
-                    'rank1': rank1,
-                    'optimizer': self._optims[name].state_dict(),
-                    'scheduler': self._scheds[name].state_dict()
+            state = {
+                'state_dict': self._models[name].state_dict(),
+                'epoch': epoch + 1,
+                'rank1': rank1,
+                'mAP': mAP,
+                'best_mAP': self.best_mAP,
+                'rng_state': {
+                    'python': random.getstate(),
+                    'numpy': np.random.get_state(),
+                    'torch': torch.get_rng_state(),
+                    'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
                 },
-                osp.join(save_dir, name),
-                is_best=is_best
+                'optimizer': self._optims[name].state_dict(),
+                'scheduler': (
+                    self._scheds[name].state_dict()
+                    if self._scheds[name] is not None else None
+                )
+            }
+            save_checkpoint(state, self.checkpoints_dir, is_best=False)
+            source_path = osp.join(
+                self.checkpoints_dir, 'model.pth.tar-' + str(epoch + 1)
             )
+            shutil.copy2(source_path, osp.join(self.checkpoints_dir, 'latest.pth'))
+            periodic_path = osp.join(
+                self.checkpoints_dir, 'epoch_{:03d}.pth'.format(epoch + 1)
+            )
+            shutil.copy2(source_path, periodic_path)
+            if is_best:
+                shutil.copy2(
+                    source_path,
+                    osp.join(self.checkpoints_dir, 'best_mAP.pth')
+                )
 
     def set_model_mode(self, mode='train', names=None):
         assert mode in ['train', 'eval', 'test']
@@ -165,6 +208,12 @@ class Engine(object):
                 'visrank can be set to True only if test_only=True'
             )
 
+        self.output_dir = save_dir
+        self.logs_dir = osp.join(save_dir, 'logs')
+        self.checkpoints_dir = osp.join(save_dir, 'checkpoints')
+        os.makedirs(self.logs_dir, exist_ok=True)
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
+
         if test_only:
             self.test(
                 dist_metric=dist_metric,
@@ -179,7 +228,7 @@ class Engine(object):
             return
 
         if self.writer is None:
-            self.writer = SummaryWriter(log_dir=save_dir)
+            self.writer = SummaryWriter(log_dir=osp.join(self.logs_dir, 'tensorboard'))
 
         time_start = time.time()
         self.start_epoch = start_epoch
@@ -206,7 +255,15 @@ class Engine(object):
                     use_metric_cuhk03=use_metric_cuhk03,
                     ranks=ranks
                 )
-                self.save_model(self.epoch, rank1, save_dir)
+                eval_values = list(self.last_eval_metrics.values())
+                current_map = eval_values[-1]['mAP'] if eval_values else 0.0
+                is_best = current_map > self.best_mAP
+                if is_best:
+                    self.best_mAP = current_map
+                self.save_model(
+                    self.epoch, rank1, save_dir,
+                    is_best=is_best, mAP=current_map
+                )
 
         if self.max_epoch > 0:
             print('=> Final test')
@@ -219,15 +276,40 @@ class Engine(object):
                 use_metric_cuhk03=use_metric_cuhk03,
                 ranks=ranks
             )
-            self.save_model(self.epoch, rank1, save_dir)
+            eval_values = list(self.last_eval_metrics.values())
+            current_map = eval_values[-1]['mAP'] if eval_values else 0.0
+            is_best = current_map > self.best_mAP
+            if is_best:
+                self.best_mAP = current_map
+            self.save_model(
+                self.epoch, rank1, save_dir,
+                is_best=is_best, mAP=current_map
+            )
 
-        elapsed = round(time.time() - time_start)
+        elapsed_seconds = time.time() - time_start
+        summary_path = osp.join(self.logs_dir, 'experiment_summary.csv')
+        _append_csv(
+            summary_path,
+            ['completed_epochs', 'total_run_time_seconds', 'total_run_time_hms',
+             'best_mAP', 'last_rank1', 'last_mAP'],
+            {
+                'completed_epochs': self.max_epoch,
+                'total_run_time_seconds': round(elapsed_seconds, 3),
+                'total_run_time_hms': str(datetime.timedelta(seconds=int(elapsed_seconds))),
+                'best_mAP': self.best_mAP,
+                'last_rank1': rank1 if self.max_epoch > 0 else '',
+                'last_mAP': current_map if self.max_epoch > 0 else ''
+            }
+        )
+        elapsed = round(elapsed_seconds)
         elapsed = str(datetime.timedelta(seconds=elapsed))
         print('Elapsed {}'.format(elapsed))
         if self.writer is not None:
             self.writer.close()
 
     def train(self, print_freq=10, fixbase_epoch=0, open_layers=None):
+        epoch_start_time = time.time()
+        lr_for_epoch = self.get_current_lr()
         losses = MetricMeter()
         batch_time = AverageMeter()
         data_time = AverageMeter()
@@ -284,6 +366,23 @@ class Engine(object):
 
             end = time.time()
 
+        epoch_seconds = time.time() - epoch_start_time
+        training_row = {
+            'epoch': self.epoch + 1,
+            'loss': losses.meters['loss'].avg if 'loss' in losses.meters else '',
+            'classification_accuracy_percent': (
+                losses.meters['acc'].avg if 'acc' in losses.meters else ''
+            ),
+            'learning_rate_used': lr_for_epoch,
+            'epoch_time_seconds': round(epoch_seconds, 3),
+            'average_batch_time_seconds': round(batch_time.avg, 5),
+            'average_data_time_seconds': round(data_time.avg, 5)
+        }
+        _append_csv(
+            osp.join(self.logs_dir, 'training_metrics.csv'),
+            list(training_row.keys()),
+            training_row
+        )
         self.update_lr()
 
     def forward_backward(self, data):
@@ -314,6 +413,7 @@ class Engine(object):
             but not a must. Please refer to the source code for more details.
         """
         self.set_model_mode('eval')
+        self.last_eval_metrics = {}
         targets = list(self.test_loader.keys())
 
         for name in targets:
@@ -335,9 +435,25 @@ class Engine(object):
                 rerank=rerank
             )
 
+            cmc_values = getattr(self, '_last_cmc_values', [])
+            metric_row = {
+                'epoch': self.epoch + 1,
+                'dataset': name,
+                'Rank-1': cmc_values[0] if len(cmc_values) >= 1 else rank1,
+                'Rank-5': cmc_values[4] if len(cmc_values) >= 5 else '',
+                'Rank-10': cmc_values[9] if len(cmc_values) >= 10 else '',
+                'Rank-20': cmc_values[19] if len(cmc_values) >= 20 else '',
+                'mAP': mAP
+            }
+            self.last_eval_metrics[name] = metric_row
+            _append_csv(
+                osp.join(self.logs_dir or save_dir, 'evaluation_metrics.csv'),
+                list(metric_row.keys()),
+                metric_row
+            )
             if self.writer is not None:
-                self.writer.add_scalar(f'Test/{name}/rank1', rank1, self.epoch)
-                self.writer.add_scalar(f'Test/{name}/mAP', mAP, self.epoch)
+                self.writer.add_scalar('Test/{}/rank1'.format(name), rank1, self.epoch)
+                self.writer.add_scalar('Test/{}/mAP'.format(name), mAP, self.epoch)
 
         return rank1
 
@@ -430,6 +546,7 @@ class Engine(object):
                 topk=visrank_topk
             )
 
+        self._last_cmc_values = cmc.tolist() if hasattr(cmc, 'tolist') else list(cmc)
         return cmc[0], mAP
 
     def compute_loss(self, criterion, outputs, targets):

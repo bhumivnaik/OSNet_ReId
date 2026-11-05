@@ -139,3 +139,27 @@ log/
 saved-models/
 model-zoo/
 debug*
+
+
+# Local datasets
+Market-1501/
+market1501/
+market1501_data/
+Market-1501-v15.09.15/
+
+# Model checkpoints
+*.pth
+*.pth.tar
+*.pth.tar-*
+*.pt
+*.onnx
+
+# Training outputs
+results/
+runs/
+tensorboard/
+*.csv
+
+# Temporary files
+*.tmp
+*.bak

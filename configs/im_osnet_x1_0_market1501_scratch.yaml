@@ -1,0 +1,53 @@
+model:
+  name: 'osnet_x1_0'
+  pretrained: False
+
+sgd:
+  momentum: 0.9
+  dampening: 0.0
+  nesterov: False
+
+data:
+  workers: 4
+  type: 'image'
+  sources: ['market1501']
+  targets: ['market1501']
+  height: 256
+  width: 128
+  combineall: False
+  transforms: ['random_flip', 'random_erase']
+  save_dir: 'results/OSNet_Market1501'
+  root: 'C:/Users/naikb/OneDrive/Desktop/ShuffleNet'
+
+sampler:
+  train_sampler: 'RandomSampler'
+
+loss:
+  name: 'softmax'
+  softmax:
+    label_smooth: True
+
+train:
+  seed: 1
+  optim: 'sgd'
+  lr: 0.065
+  max_epoch: 350
+  batch_size: 64
+  fixbase_epoch: 0
+  staged_lr: False
+  weight_decay: 0.0005
+  
+  lr_scheduler: 'multi_step'
+  stepsize: [150, 225, 300]
+  gamma: 0.1
+  print_freq: 20
+
+test:
+  batch_size: 64
+  dist_metric: 'euclidean'
+  normalize_feature: False
+  ranks: [1, 5, 10, 20]
+  evaluate: False
+  eval_freq: 10
+  start_eval: 10
+  rerank: False
